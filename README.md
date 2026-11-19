@@ -166,6 +166,7 @@ Claude runs these for you, but you can run them yourself too:
 ```bash
 C="uv run --script skills/clip/clipper.py"
 $C config clipper "@yourclips"                 # your tag on every clip
+$C config cookies chrome                      # if YouTube says "confirm you're not a bot"
 $C scan  <url|file> [--chat chat.json]         # find moments (chat, audio, transcript, comments)
 $C grab  <url|file> --moments 1,3,5            # grab several picks at once
 $C render clips/<src>/m3730 --in 4 --out 38 \

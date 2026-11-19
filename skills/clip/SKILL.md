@@ -66,4 +66,5 @@ C frames <dir> 12.5 14 20      gridded frames at exact seconds, to check who's t
 
 - Whisper: `--model small` (default) on grab/prep. `medium` for heavy accents or loud game audio, `base` for speed.
 - Subscriber-only or age-gated VODs need cookies. Tell the user; don't work around it.
+- yt-dlp says "Sign in to confirm you're not a bot": ask which browser they're logged into YouTube with, then run `C config cookies <chrome|safari|firefox|brave|edge>`.
 - Clipping someone else's stream needs their permission or a clipping program they run. If the user hasn't mentioned one, remind them once.

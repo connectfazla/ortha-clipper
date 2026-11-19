@@ -47,7 +47,7 @@ def settings(update=None):
     """Global settings shared by every project, e.g. {"clipper": "@myclips"}."""
     s = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
     if update:
-        s.update({k: v for k, v in update.items() if k in ("clipper", "profiles")})
+        s.update({k: v for k, v in update.items() if k in ("clipper", "profiles", "cookies")})
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(s, indent=1))
     return s
@@ -64,7 +64,9 @@ def ff(*args):
     sh([FF, "-y", "-hide_banner", "-loglevel", "error", *args])
 
 def ytdlp(*args):
-    return [sys.executable, "-m", "yt_dlp", "--quiet", "--no-warnings", "--ffmpeg-location", FF, *args]
+    b = settings().get("cookies")  # YouTube "confirm you're not a bot": borrow the user's logged-in browser session
+    return [sys.executable, "-m", "yt_dlp", "--quiet", "--no-warnings", "--ffmpeg-location", FF,
+            *(["--cookies-from-browser", b] if b else []), *args]
 
 def is_local(src):
     return Path(src).exists()
@@ -210,7 +212,11 @@ def load_chat(src, d, chat_file=None):
         out = d / "chat"
         if not Path(f"{out}.live_chat.json").exists():
             log("downloading YouTube chat replay", "progress", src)
-            sh(ytdlp("--skip-download", "--write-subs", "--sub-langs", "live_chat", "-o", out, src))
+            r = subprocess.run([str(c) for c in ytdlp("--skip-download", "--write-subs", "--sub-langs", "live_chat",
+                                                      "-o", out, src)], capture_output=True, text=True)
+            if r.returncode:  # chat is a bonus signal: fall back to audio instead of killing the scan
+                why = (r.stderr.strip().splitlines() or ["unknown error"])[-1]
+                log(f"no chat replay ({why[:160]}), so scoring on audio + transcript", "progress", src)
         f = Path(f"{out}.live_chat.json")
         return read_chat_file(f) if f.exists() else []
     log("no public chat-replay API for this site, so scoring on audio only. For chat scoring, export the chat "
@@ -920,6 +926,23 @@ def state():
     short = lambda e: {**e, "msg": e["msg"].replace(str(ROOT) + "/", "")}  # paths relative to the clips folder
     return {"root": str(ROOT), "now": time.time(), "events": [short(json.loads(l)) for l in lines], "sources": sources}
 
+KEEP = {"info.json", "moments.json", "timeline.json"}  # small results the dashboard shows; clips live in m*/ and live/
+
+def clear_cache():
+    """Delete what a scan can download or rebuild (audio, chat, comments, transcripts, temp folders, job logs).
+    Keeps clips, renders, moment lists and settings. Returns bytes freed."""
+    if any(j["proc"].poll() is None for j in JOBS.values()):
+        raise ValueError("Stop running jobs first.")
+    junk = [*ROOT.glob(".jobs/*.log"), *ROOT.glob("*/live/buf"), *ROOT.glob("*/m*/.render"), *ROOT.glob("*/live/*/.render")]
+    for d in (p for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith(".")) if ROOT.exists() else []:
+        junk += [f for f in d.iterdir() if f.name not in KEEP and not (f.is_dir() and (f.name == "live" or re.fullmatch(r"m\d+.*", f.name)))]
+    freed = 0
+    for f in junk:
+        freed += sum(x.stat().st_size for x in f.rglob("*") if x.is_file()) if f.is_dir() else f.stat().st_size
+        shutil.rmtree(f, ignore_errors=True) if f.is_dir() else f.unlink(missing_ok=True)
+    log(f"cache cleared: {freed / 1e6:.0f} MB freed", "done", ROOT)
+    return freed
+
 JOBS = {}  # dashboard-started jobs: id -> {proc, action, src, model, started}
 URL_OK = re.compile(r"^https?://[\w.-]+(:\d+)?(/[^\s\"'`<>]*)?$")
 
@@ -1005,7 +1028,8 @@ def start_job(b):
     proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
                             env={**os.environ, "ORTHA_DIR": str(ROOT)})
     ai = action in ("auto", "edit")
-    JOBS[jid] = {"proc": proc, "action": action, "label": label, "src": src, "model": model if ai else None, "started": time.time()}
+    JOBS[jid] = {"proc": proc, "action": action, "label": label, "src": src, "model": model if ai else None, "started": time.time(),
+                 "body": b}  # kept so a failed job can be retried as-is
     log(f"{label}: {src}", "start", src)
 
     def wait():
@@ -1014,6 +1038,8 @@ def start_job(b):
         if code == 0:
             log(f"{label} finished. {tail if ai else ''}".strip(), "done", src)
         elif code > 0:
+            lines = (ROOT / ".jobs" / f"{jid}.log").read_text(errors="replace").strip().splitlines()  # yt-dlp's own "ERROR: ..." beats our generic "failed: <cmd>" line
+            JOBS[jid]["error"] = next((l for l in reversed(lines) if l.startswith("ERROR")), lines[-1] if lines else f"exit {code}")[:200]
             log(f"{label} failed (exit {code}): {tail[-200:]}", "error", src)
     threading.Thread(target=wait, daemon=True).start()
     return jid
@@ -1039,6 +1065,14 @@ def dash(_a=None):
                     res = {"id": start_job(body)}
                 elif path == "/api/settings":
                     res = settings({"clipper": str(body.get("clipper", ""))[:60]})
+                elif path in ("/api/retry", "/api/dismiss"):
+                    job = JOBS.get(body.get("id"))
+                    if not job or job["proc"].poll() in (None, 0):
+                        raise ValueError("No failed job with that id.")
+                    del JOBS[body["id"]]
+                    res = {"id": start_job(job["body"])} if path == "/api/retry" else {"ok": True}
+                elif path == "/api/clear-cache":
+                    res = {"freed": clear_cache()}
                 elif path == "/api/stop":
                     job = JOBS.get(body.get("id"))
                     if job and job["proc"].poll() is None:
@@ -1067,7 +1101,9 @@ def dash(_a=None):
                 return self.send(page.read_text().replace("{{TOKEN}}", token).encode(), "text/html; charset=utf-8")
             if path == "/api/state":
                 s = state()
-                s["jobs"] = [{"id": k, **{x: v for x, v in j.items() if x != "proc"}} for k, j in JOBS.items() if j["proc"].poll() is None]
+                pub = lambda k, j: {"id": k, **{x: v for x, v in j.items() if x not in ("proc", "body")}}
+                s["jobs"] = [pub(k, j) for k, j in JOBS.items() if j["proc"].poll() is None]
+                s["failed"] = [pub(k, j) for k, j in JOBS.items() if (j["proc"].poll() or 0) > 0]  # stopped = negative, not failed
                 s["claude"] = bool(shutil.which("claude"))
                 s["settings"] = settings()
                 return self.send(json.dumps(s).encode(), "application/json")
@@ -1151,8 +1187,8 @@ def main():
     lv.add_argument("--threshold", type=float, default=3.5)
     lv.add_argument("--pre", type=int, default=40); lv.add_argument("--post", type=int, default=15)
     fr = sub.add_parser("frames"); fr.add_argument("dir"); fr.add_argument("times", nargs="+")
-    cf = sub.add_parser("config", help="config clipper @handle  (shown on every clip)")
-    cf.add_argument("key", nargs="?", choices=["clipper"]); cf.add_argument("value", nargs="?")
+    cf = sub.add_parser("config", help="config clipper @handle (shown on every clip) | config cookies chrome (YouTube bot check)")
+    cf.add_argument("key", nargs="?", choices=["clipper", "cookies"]); cf.add_argument("value", nargs="?")
     sub.add_parser("dash")
     a = p.parse_args()
     global CMD

@@ -297,6 +297,7 @@ header { display: flex; align-items: center; gap: 12px; padding: 0 14px; border-
       <div class="sec" style="border-bottom:0"><h5>Moments <span class="num" id="mcount"></span></h5><div class="list" id="moments"></div></div>
       <div class="grow"></div>
       <div class="sec" id="jobsec" hidden><h5>Running</h5><div class="jobs" id="jobs"></div></div>
+      <div class="sec" style="border-bottom:0"><button class="btn sm ghost" id="clearcache" type="button" style="width:100%" title="Deletes downloaded audio, chat, comments and transcripts. Keeps your clips.">Clear cache</button></div>
     </aside>
 
     <main class="center" id="center"></main>
@@ -342,6 +343,14 @@ $("#tagchip").onclick = () => pop($("#tagform").hidden);
 $("#tagcancel").onclick = () => pop(false);
 $("#tagform").onsubmit = async e => { e.preventDefault(); try { await api("/api/settings", { clipper: $("#tag").value.trim() }); pop(false); reset("tag"); tick(); } catch (err) { alert(err.message); } };
 $("#home").onclick = () => setView("home");
+$("#clearcache").onclick = async e => {
+  const b = e.currentTarget;
+  if (!confirm("Delete downloaded audio, chat, comments and transcripts?\n\nYour clips, renders and moment lists stay. Rescan a stream to rebuild its data.")) return;
+  b.disabled = true;
+  try { const r = await api("/api/clear-cache", {}); b.textContent = `Cleared ${Math.round(r.freed / 1e6)} MB`; tick(); }
+  catch (err) { alert(err.message); b.textContent = "Clear cache"; }
+  setTimeout(() => { b.disabled = false; b.textContent = "Clear cache"; }, 3000);
+};
 $("#newbtn").onclick = () => { setView("home"); setTimeout(() => $("#hurl") && $("#hurl").focus(), 50); };
 function setView(v) { view = v; document.querySelectorAll("[data-view]").forEach(x => x.setAttribute("aria-pressed", x.dataset.view === v)); reset("center", "insp", "stage", "out", "transport", "tl", "streams", "moments", "hprog", "hstreams", "hclips"); render(); }
 document.querySelectorAll("[data-view]").forEach(b => b.onclick = () => setView(b.dataset.view));
@@ -750,10 +759,11 @@ function drawHome() {
     };
   }
   // in progress
-  if (changed("hprog", [S.jobs.map(j => [j.id, lastFor(j.src)]), Math.floor(S.now / 5)])) {
-    $("#hprog").hidden = !S.jobs.length;
-    $("#hprog").innerHTML = S.jobs.length ? `<h3>In progress <span class="num">${S.jobs.length}</span></h3><div class="prog">${S.jobs.map(j => `<div class="prow"><span class="sdot working" aria-hidden="true"></span><div style="min-width:0"><div class="l">${esc(j.label || j.action)}</div><div class="s">${esc(lastFor(j.src) || j.src)}</div></div><span class="el">${elapsed(j.started)}</span><button class="btn sm" data-stop="${esc(j.id)}">Stop</button></div>`).join("")}</div>` : "";
+  if (changed("hprog", [S.jobs.map(j => [j.id, lastFor(j.src)]), S.failed.map(j => j.id), Math.floor(S.now / 5)])) {
+    $("#hprog").hidden = !S.jobs.length && !S.failed.length;
+    $("#hprog").innerHTML = (S.jobs.length ? `<h3>In progress <span class="num">${S.jobs.length}</span></h3><div class="prog">${S.jobs.map(j => `<div class="prow"><span class="sdot working" aria-hidden="true"></span><div style="min-width:0"><div class="l">${esc(j.label || j.action)}</div><div class="s">${esc(lastFor(j.src) || j.src)}</div></div><span class="el">${elapsed(j.started)}</span><button class="btn sm" data-stop="${esc(j.id)}">Stop</button></div>`).join("")}</div>` : "") + (S.failed.length ? `<h3>Failed <span class="num">${S.failed.length}</span></h3><div class="prog">${S.failed.map(j => `<div class="prow"><span class="sdot live" style="animation:none" aria-hidden="true"></span><div style="min-width:0"><div class="l">${esc(j.label || j.action)}</div><div class="s" style="color:var(--bad)">${esc(j.error || "failed")}</div></div><button class="btn sm primary" data-retry="${esc(j.id)}">Retry</button><button class="btn sm ghost" data-dismiss="${esc(j.id)}" aria-label="Dismiss">Dismiss</button></div>`).join("")}</div>` : "");
     $("#hprog").querySelectorAll("[data-stop]").forEach(b => b.onclick = async () => { b.disabled = true; await api("/api/stop", { id: b.dataset.stop }).catch(() => {}); tick(); });
+    $("#hprog").querySelectorAll("[data-retry],[data-dismiss]").forEach(b => b.onclick = async () => { b.disabled = true; const r = !!b.dataset.retry; await api(r ? "/api/retry" : "/api/dismiss", { id: b.dataset.retry || b.dataset.dismiss }).catch(e => alert(e.message)); tick(); });
   }
   // streams
   if (changed("hstreams", [S.sources.map(s => [s.name, s.info, s.moments.length, s.clips.map(c => c.renders.length), srcStatus(s), !!s.timeline])])) {

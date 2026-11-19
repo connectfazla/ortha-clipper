@@ -359,8 +359,10 @@ $("#status").onclick = () => $("#drawer").classList.toggle("open");
 $("#dclose").onclick = () => $("#drawer").classList.remove("open");
 
 async function tick() {
-  try { S = await (await fetch("/api/state", { cache: "no-store" })).json(); render(); }
-  catch { $("#status-text").textContent = "Dashboard offline. Run any Ortha Clipper command to restart it."; $("#status").className = "status err"; }
+  try { S = await (await fetch("/api/state", { cache: "no-store" })).json(); }
+  catch { $("#status-text").textContent = "Dashboard offline. Run any Ortha Clipper command to restart it."; $("#status").className = "status err"; return; }
+  S.failed ??= [];  // a server started before this page version has no "failed" list
+  render();  // a render bug shows in the console, not as "offline"
 }
 
 /* ---------- selection helpers ---------- */

@@ -172,6 +172,8 @@ $C grab  <url|file> --moments 1,3,5            # grab several picks at once
 $C render clips/<src>/m3730 --in 4 --out 38 \
      --cam 0.73,0.04,0.25,0.26 --hook "he got wasted" --remember
 $C live  <url>                                 # clip a live stream as it happens
+$C find  ["Grand Theft Auto VI"]               # who is live now, most viewers first
+$C config twitch_id <id>; $C config twitch_secret <secret>  # Twitch in find (free app at dev.twitch.tv)
 $C frames clips/<src>/m3730 12 14.5 20         # check exact moments
 ```
 

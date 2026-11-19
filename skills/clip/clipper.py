@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["yt-dlp", "faster-whisper", "pillow", "numpy", "imageio-ffmpeg"]
+# dependencies = ["yt-dlp[default]", "faster-whisper", "pillow", "numpy", "imageio-ffmpeg"]
 # ///
 """Ortha Clipper: stream -> chat-spike moments -> captioned 9:16 shorts.
 
@@ -13,12 +13,13 @@ Claude Code is the editor: it picks moments, trims, writes hooks, checks frames.
   prep   DIR                 transcribe + frame for a DIR that already has seg.mp4 (live moments)
   render DIR --in --out ...  cut, reframe to 9:16, burn word-by-word captions, hook, credit
   live   SRC                 watch a live stream; save a moment every time chat spikes
+  find   [GAME]              who is live right now (YouTube + Twitch), most viewers first
   dash                       serve the dashboard (auto-started by every other command)
 """
 import argparse, json, mimetypes, os, re, shutil, socket, subprocess, sys, threading, time, urllib.request, webbrowser
 from collections import Counter
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote_plus, unquote, urlencode, urlparse
 
 import numpy as np
 
@@ -47,7 +48,7 @@ def settings(update=None):
     """Global settings shared by every project, e.g. {"clipper": "@myclips"}."""
     s = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
     if update:
-        s.update({k: v for k, v in update.items() if k in ("clipper", "profiles", "cookies")})
+        s.update({k: v for k, v in update.items() if k in ("clipper", "profiles", "cookies", "twitch_id", "twitch_secret")})
         CONFIG.parent.mkdir(parents=True, exist_ok=True)
         CONFIG.write_text(json.dumps(s, indent=1))
     return s
@@ -55,7 +56,7 @@ def settings(update=None):
 def config(a):
     if a.key:
         settings({a.key: a.value or ""})
-    print(json.dumps(settings(), indent=1))
+    print(json.dumps({k: "***" if k == "twitch_secret" else v for k, v in settings().items()}, indent=1))
 
 def sh(cmd, **kw):
     return subprocess.run([str(c) for c in cmd], check=True, **kw)
@@ -362,6 +363,43 @@ def is_live(src):
         return False
     r = subprocess.run(ytdlp("--skip-download", "--print", "%(is_live)s", src), capture_output=True, text=True)
     return r.stdout.strip().splitlines()[:1] == ["True"]
+
+def twitch_live(game, n, s):
+    """Official Helix API with an app token (free app at dev.twitch.tv). Twitch returns streams by viewers, highest first."""
+    body = urlencode({"client_id": s["twitch_id"], "client_secret": s["twitch_secret"], "grant_type": "client_credentials"}).encode()
+    tok = json.load(urllib.request.urlopen("https://id.twitch.tv/oauth2/token", body, timeout=15))["access_token"]
+    def get(path, **q):
+        req = urllib.request.Request(f"https://api.twitch.tv/helix/{path}?{urlencode(q)}",
+                                     headers={"Client-Id": s["twitch_id"], "Authorization": f"Bearer {tok}"})
+        return json.load(urllib.request.urlopen(req, timeout=15))["data"]
+    g = get("games", name=game) or get("search/categories", query=game, first=1)
+    return [("Twitch", x["viewer_count"], x["user_name"], x["title"], f"https://twitch.tv/{x['user_login']}")
+            for x in (get("streams", game_id=g[0]["id"], first=min(n, 100)) if g else [])]
+
+def find(a):
+    """Who is streaming a game right now, most viewers first, so the user knows what to clip."""
+    rows = []
+    try:
+        r = sh(ytdlp("-J", "--flat-playlist", "--playlist-end", str(a.top),
+                     f"https://www.youtube.com/results?search_query={quote_plus(a.game)}&sp=EgJAAQ%253D%253D"),  # filter: live now
+               capture_output=True, text=True)
+        rows += [("YouTube", e.get("concurrent_view_count") or 0, e.get("channel") or "", e.get("title") or "", e.get("url"))
+                 for e in json.loads(r.stdout).get("entries") or [] if e and e.get("live_status") == "is_live"]
+    except subprocess.CalledProcessError:
+        print("YouTube search failed. If it's the bot check: config cookies <browser>")
+    s = settings()
+    if s.get("twitch_id") and s.get("twitch_secret"):
+        try:
+            rows += twitch_live(a.game, a.top, s)
+        except Exception as e:
+            print(f"Twitch failed: {e}")
+    else:
+        print("Twitch skipped: create a free app at dev.twitch.tv/console, then config twitch_id <id> and config twitch_secret <secret>")
+    rows.sort(key=lambda r: -r[1])
+    for plat, viewers, ch, title, url in rows[:a.top]:
+        print(f"{plat:8} {viewers:>7,}  {ch[:22]:22} {title[:58]:58} {url}")
+    if not rows:
+        print("nobody live found")
 
 def scan(a):
     if is_live(a.src):  # one action for the user: a live link gets watched live instead of scanned
@@ -1187,16 +1225,18 @@ def main():
     lv.add_argument("--threshold", type=float, default=3.5)
     lv.add_argument("--pre", type=int, default=40); lv.add_argument("--post", type=int, default=15)
     fr = sub.add_parser("frames"); fr.add_argument("dir"); fr.add_argument("times", nargs="+")
-    cf = sub.add_parser("config", help="config clipper @handle (shown on every clip) | config cookies chrome (YouTube bot check)")
-    cf.add_argument("key", nargs="?", choices=["clipper", "cookies"]); cf.add_argument("value", nargs="?")
+    fd = sub.add_parser("find", help="who is live right now, most viewers first")
+    fd.add_argument("game", nargs="?", default="Grand Theft Auto VI"); fd.add_argument("--top", type=int, default=20)
+    cf = sub.add_parser("config", help="config clipper @handle (shown on every clip) | config cookies chrome (YouTube bot check) | config twitch_id/twitch_secret (find)")
+    cf.add_argument("key", nargs="?", choices=["clipper", "cookies", "twitch_id", "twitch_secret"]); cf.add_argument("value", nargs="?")
     sub.add_parser("dash")
     a = p.parse_args()
     global CMD
     CMD = a.cmd
-    if a.cmd not in ("dash", "config", "frames"):
+    if a.cmd not in ("dash", "config", "frames", "find"):
         ensure_dash()
     try:
-        {"scan": scan, "grab": grab, "prep": prep, "render": render, "live": live, "dash": dash, "frames": frames, "config": config}[a.cmd](a)
+        {"scan": scan, "grab": grab, "prep": prep, "render": render, "live": live, "dash": dash, "frames": frames, "config": config, "find": find}[a.cmd](a)
     except subprocess.CalledProcessError as e:
         log(f"failed: {' '.join(map(str, e.cmd))[:200]}", "error")
         raise SystemExit(1)

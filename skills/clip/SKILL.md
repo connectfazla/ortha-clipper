@@ -22,6 +22,11 @@ The script does the mechanical work. You make the editorial calls, the way a goo
 - **Escalate** to `model: "opus"` only for a clip that comes back `needs review`.
 - If subagents aren't available, follow `agents/clip-editor.md` yourself, one clip at a time.
 
+## No link yet: find streams and campaigns
+
+- `C find ["Grand Theft Auto VI"]` lists who is live now, most viewers first. YouTube always works (it needs cookies if the bot check fires). Twitch needs a free app from dev.twitch.tv/console, then `C config twitch_id <id>` and `C config twitch_secret <secret>`. Never use Twitch's private web client ID.
+- Paid clipping programs: when the user asks where to earn, check live listings on Whop Content Rewards (`whop.com/discover`, search "clipping") and `clip.tech/clippers`. Report each campaign's rate per 1K views, budget left, rules and link exactly as the page shows them, and never guess a number. Clip only the creators a campaign covers, and follow its rules (length, tags, credit) in the render and `post.md`.
+
 ## VOD / long video (posted after the stream, or a local file)
 
 1. `C scan <url-or-file>`: run it in the **foreground** with a 600000 ms timeout. Don't background it and poll; every poll resends your whole context. It gets the chat, the smallest *original-language* audio track (never the video), YouTube comment timestamps, and a local Whisper transcript of the whole stream (about 5 min per hour; `--no-transcript` skips it). **If it times out on a long stream, run it again: it resumes.**

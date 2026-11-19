@@ -1,0 +1,12 @@
+{
+  "name": "ortha-clipper",
+  "description": "AI stream clipper for Claude Code: streams to captioned 9:16 shorts, with Claude as the editor.",
+  "owner": { "name": "connectfazla", "url": "https://github.com/connectfazla" },
+  "plugins": [
+    {
+      "name": "ortha-clipper",
+      "source": "./",
+      "description": "Turn Twitch/YouTube streams (live or VOD) into captioned 9:16 shorts. Claude is the editor."
+    }
+  ]
+}

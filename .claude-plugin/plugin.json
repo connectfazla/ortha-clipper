@@ -1,0 +1,10 @@
+{
+  "name": "ortha-clipper",
+  "version": "0.1.0",
+  "description": "AI stream clipper for Claude Code: turn Twitch/YouTube streams (live or VOD), including GTA VI gameplay, into captioned 9:16 Shorts, TikToks and Reels. Finds chat spikes above the channel's own baseline; Claude edits, reframes, captions and QA-checks every clip. Local dashboard included.",
+  "author": { "name": "connectfazla", "url": "https://github.com/connectfazla" },
+  "homepage": "https://github.com/connectfazla/ortha-clipper",
+  "repository": "https://github.com/connectfazla/ortha-clipper",
+  "license": "MIT",
+  "keywords": ["gta-6", "gta-vi", "clips", "twitch", "youtube", "shorts", "tiktok", "reels", "stream-highlights", "auto-clipper", "ffmpeg", "whisper"]
+}

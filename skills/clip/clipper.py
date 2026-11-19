@@ -217,8 +217,10 @@ def load_chat(src, d, chat_file=None):
         "(e.g. TwitchDownloaderCLI chatdownload --id <vod> -o chat.json) and pass --chat chat.json", "progress", src)
     return []
 
-def live_chat(src, push):
-    """push(text, user) for each live message. Twitch: anonymous IRC. YouTube: yt-dlp live_chat stream."""
+def live_chat(src, push, d=None, procs=None):
+    """push(text, user) for each live message. Twitch: anonymous IRC. YouTube: yt-dlp writes the live chat to a
+    file as it arrives (it can't stream it to stdout), so tail that file. Child processes go in `procs` so the
+    caller can stop them."""
     if "twitch.tv" in src:
         ch = urlparse(src).path.strip("/").split("/")[0].lower()
         s = socket.create_connection(("irc.chat.twitch.tv", 6667))
@@ -233,28 +235,112 @@ def live_chat(src, push):
                     push(l.split(b" PRIVMSG ", 1)[1].split(b" :", 1)[-1].decode(errors="replace"),
                          l[1:].split(b"!", 1)[0].decode(errors="replace"))
     elif "youtu" in src:
-        p = subprocess.Popen(ytdlp("--skip-download", "--write-subs", "--sub-langs", "live_chat", "-o", "-", src),
-                             stdout=subprocess.PIPE, text=True)
-        for line in p.stdout:
-            for _, msg, user in yt_chat_line(line):
-                push(msg, user)
+        out = Path(d or ROOT) / "livechat"
+        for old in Path(out.parent).glob("livechat.live_chat.json*"):
+            old.unlink(missing_ok=True)
+        p = subprocess.Popen(ytdlp("--skip-download", "--write-subs", "--sub-langs", "live_chat", "-o", out, src),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if procs is not None:
+            procs.append(p)
+        f, pos, rest = Path(f"{out}.live_chat.json.part"), 0, ""
+        while p.poll() is None:
+            time.sleep(1)
+            if not f.exists():
+                continue
+            with open(f, errors="replace") as fh:
+                fh.seek(pos)
+                chunk = fh.read()
+                pos = fh.tell()
+            *lines, rest = (rest + chunk).split("\n")
+            for line in lines:
+                for _, msg, user in yt_chat_line(line):
+                    push(msg, user)
     else:
         log("live chat is supported for Twitch and YouTube only", "error", src)
 
 
 # ---------- scan ----------
 
-def loudness(src, d):
-    """dB RMS per BIN seconds. Remote: grab the smallest audio-only track (~20 MB/h; yt-dlp's chunked
-    download dodges the throttling a direct ffmpeg read gets), never the video."""
-    path = src
-    if not is_local(src):
-        path = next(d.glob("audio.*"), None)
-        if not path:
-            log("downloading audio track (smallest available)", "progress", src)
-            sh(ytdlp("-f", "wa/ba/audio_only/w", "-N", "4", "-o", d / "audio.%(ext)s", src))
-            path = next(d.glob("audio.*"))
-    log("measuring loudness", "progress", src)
+def audio_path(src, d):
+    """Remote: the smallest audio-only track (~20 MB/h; yt-dlp's chunked download dodges the throttling
+    a direct ffmpeg read gets), never the video."""
+    if is_local(src):
+        return Path(src)
+    path = next(d.glob("audio.*"), None)
+    if not path:
+        log("downloading audio track (smallest available)", "progress", src)
+        # "lang" first: YouTube now ships AI-dubbed audio tracks, and plain "smallest audio" picks a dub
+        sh(ytdlp("-f", "ba/audio_only/b", "-S", "lang,+abr", "-N", "4", "-o", d / "audio.%(ext)s", src))
+        path = next(d.glob("audio.*"))
+    return path
+
+WHISPER = {}
+
+def whisper(model):
+    if model not in WHISPER:
+        from faster_whisper import WhisperModel
+        WHISPER[model] = WhisperModel(model, device="auto", compute_type="auto", cpu_threads=os.cpu_count() or 4)
+    return WHISPER[model]
+
+# what streamers say when something just happened (clippers scan for these by ear)
+REACT = re.compile(r"(?i)\b(oh my (god|gosh)|no way|what the|let'?s go+|holy (shit|crap|cow)?|are you (kidding|serious)|"
+                   r"i can'?t believe|wait,? wait|no,? no,? no|yes,? yes|clip (it|that)|did you see|ha(ha)+|insane|"
+                   r"crazy|bro+|dude|fuck|shit|what\?!|chat,? (look|did))\b")
+
+def stream_lang(path, d, model):
+    """Spoken language, from 90 s a quarter of the way in. Intros are often music, which fools Whisper's
+    first-30-s guess (a CohhCarnage panel came out in Arabic). Saved in info.json so clips reuse it."""
+    info = json.loads((d / "info.json").read_text()) if (d / "info.json").exists() else {}
+    if not info.get("lang"):
+        raw = subprocess.run([FF, "-v", "error", "-ss", str(duration(path) * 0.25), "-t", "90", "-i", str(path),
+                              "-ac", "1", "-ar", "16000", "-f", "f32le", "-"], capture_output=True).stdout
+        _, det = whisper(model).transcribe(np.frombuffer(raw, np.float32), vad_filter=True)
+        info["lang"] = det.language
+        (d / "info.json").write_text(json.dumps(info))
+    return info["lang"]
+
+def full_transcript(path, d, src, model):
+    """Whole-stream transcript, local and free, so moments can be found from what was said, not only chat.
+    Resumable: if it gets interrupted, the next scan continues from the last finished line."""
+    out = d / f"transcript_full.{model}.jsonl"
+    if not out.exists():
+        lang = stream_lang(path, d, model)
+        tmp = out.with_suffix(".part")
+        start = json.loads(tmp.read_text().splitlines()[-1])[1] if tmp.exists() and tmp.read_text().strip() else 0
+        log(f"transcribing the whole stream ({model}, {lang}{', resuming at ' + hms(start) if start else ''}) "
+            f"to find stories and takes chat missed", "progress", src)
+        segs, _ = whisper(model).transcribe(str(path), language=lang, vad_filter=True, beam_size=1,
+                                            condition_on_previous_text=False, clip_timestamps=[start] if start else "0")
+        last = start
+        with open(tmp, "a") as f:
+            for sg in segs:
+                f.write(json.dumps([round(sg.start, 1), round(sg.end, 1), sg.text.strip()]) + "\n")
+                f.flush()
+                if sg.start - last >= 600:
+                    last = sg.start
+                    log(f"transcript: {hms(sg.start)} done", "progress", src)
+        tmp.rename(out)
+    return [json.loads(l) for l in open(out)]
+
+def comment_marks(src, d):
+    """Timestamps viewers wrote in YouTube comments ("2:13:40 LMAO"): the moments people remember."""
+    if "youtu" not in src:
+        return []
+    f = d / "comments.info.json"
+    if not f.exists():
+        log("reading timestamps from YouTube comments", "progress", src)
+        subprocess.run(ytdlp("--skip-download", "--write-info-json", "--write-comments", "--no-write-playlist-metafiles",
+                             "--extractor-args", "youtube:max_comments=400,all,0;comment_sort=top", "-o", d / "comments", src),
+                       capture_output=True)
+    if not f.exists():
+        return []
+    marks = []
+    for c in json.loads(f.read_text()).get("comments") or []:
+        for h, m, sec in re.findall(r"(?<![\d:])(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?![\d:])", c.get("text", "")):
+            marks.append((int(h or 0) * 3600 + int(m) * 60 + int(sec), 1 + min(c.get("like_count") or 0, 50) / 10, c["text"][:120]))
+    return marks
+
+def loudness(path, src):
     p = subprocess.Popen([FF, "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], stdout=subprocess.PIPE)
     out, n = [], 8000 * BIN * 2
     while chunk := p.stdout.read(n):
@@ -269,8 +355,13 @@ def scan(a):
     log(f"scan started: {a.src}", "start", a.src)
     msgs = load_chat(a.src, d, a.chat) if (a.chat or not is_local(a.src)) else []
     log(f"chat: {len(msgs)} messages", "progress", a.src)
-    audio = np.array([]) if a.no_audio else loudness(a.src, d)
-    n = max(len(audio), int(max((m[0] for m in msgs), default=0) // BIN) + 1)
+    if msgs:
+        (d / "chat_norm.jsonl").write_text("".join(json.dumps(m) + "\n" for m in msgs))
+    path = audio_path(a.src, d)
+    audio = np.array([]) if a.no_audio else loudness(path, a.src)
+    segs = [] if a.no_transcript else full_transcript(path, d, a.src, a.transcript_model)
+    marks = comment_marks(a.src, d)
+    n = max(len(audio), int(max((m[0] for m in msgs), default=0) // BIN) + 1, int(max((g[1] for g in segs), default=0) // BIN) + 1)
     count, hype = np.zeros(n), np.zeros(n)
     by_bin, users = [[] for _ in range(n)], [set() for _ in range(n)]
     for t, m, u in msgs:
@@ -290,7 +381,28 @@ def scan(a):
     # chat reacts 5-20s after the event, so look back for the audio peak
     az_back = np.array([az[max(0, i - 4):i + 1].max() for i in range(n)])
     hype_ratio = np.divide(hype, count, out=np.zeros(n), where=count > 0)
-    score = (cz + 0.6 * az_back + 2 * hype_ratio) if msgs else az
+    # what was said: speech rate, reaction words, and the silence-then-outburst shape clippers listen for
+    words, react, said = np.zeros(n), np.zeros(n), [[] for _ in range(n)]
+    for s0, s1, text in segs:
+        b0, b1 = int(s0 // BIN), max(int(s0 // BIN), int(s1 // BIN))
+        for i in range(b0, min(n, b1 + 1)):
+            words[i] += len(text.split()) / (b1 - b0 + 1)
+        if b0 < n:
+            said[b0].append(text)
+            react[b0] += len(REACT.findall(text))
+    sz = baseline_z(words) if segs else np.zeros(n)
+    au = np.pad(audio, (0, n - len(audio))) if len(audio) else np.zeros(n)
+    jump = np.array([au[i] - au[max(0, i - 3):i].min() if i else 0 for i in range(n)])
+    jz = baseline_z(jump) if len(audio) else np.zeros(n)
+    cm, cm_text = np.zeros(n), [[] for _ in range(n)]
+    for t, w, text in marks:  # comment timestamps are approximate: spread over +-10 s
+        for i in range(max(0, int(t // BIN) - 2), min(n, int(t // BIN) + 3)):
+            cm[i] += w
+            cm_text[i].append(text)
+    react_back = np.array([react[max(0, i - 6):i + 1].sum() for i in range(n)])
+    # balanced blend, each signal capped so no single one (a giant chat wave, one viral comment) decides alone
+    score = ((np.minimum(cz, 6) + 0.6 * np.minimum(az_back, 6) + 2 * hype_ratio) if msgs else np.minimum(az, 6)) \
+        + 0.35 * np.clip(sz, 0, None) + 0.8 * np.minimum(react_back, 3) + 0.4 * np.clip(jz, 0, 6) + 1.5 * np.minimum(cm, 4)
 
     picked = []
     for i in np.argsort(-score):
@@ -305,29 +417,63 @@ def scan(a):
         peak = i * BIN
         window = [m for j in range(max(0, i - 7), min(n, i + 3)) for m in by_bin[j]]
         common = Counter(re.sub(r"\s+", " ", m.strip().lower())[:40] for m in window).most_common(6)
+        quote = " ".join(t for j in range(max(0, i - 8), min(n, i + 2)) for t in said[j])
+        why = [f"chat {people[i]:.0f} people vs {np.median(people):.0f} normal" if msgs and cz[i] >= 2 else "",
+               "loud" if az_back[i] >= 2 else "", "silence then outburst" if jz[i] >= 2 else "",
+               "talking fast" if sz[i] >= 2 else "",
+               "said: " + ", ".join(sorted({m[0].lower() for j in range(max(0, i - 6), i + 1) for m in REACT.findall(" ".join(said[j]))}))
+               if react_back[i] else "",
+               f"{len(set(cm_text[i]))} YouTube comments point here" if cm[i] else ""]
         moments.append({
             "start": max(0, peak - a.pre), "end": peak + a.post, "peak": peak,
             "score": round(float(score[i]), 1), "chat_z": round(float(cz[i]), 1), "audio_z": round(float(az_back[i]), 1),
             "msgs_per_min": round(count[i] * 60 / BIN), "baseline_per_min": round(base),
             "people": int(people[i]), "people_baseline": round(float(np.median(people)), 1),
             "top_chat": [f"{m} x{c}" if c > 1 else m for m, c in common], "sample": window[-15:],
+            "why": [w for w in why if w], "said": quote[-280:], "comments": list(dict.fromkeys(cm_text[i]))[:3],
         })
     (d / "moments.json").write_text(json.dumps(moments, indent=1, ensure_ascii=False))
     trail = [float(np.median(count[max(0, i - 120):i])) if i else 0 for i in range(n)]
     (d / "timeline.json").write_text(json.dumps({
         "src": a.src, "bin": BIN, "per_min": (count * 60 / BIN).round().tolist(),
-        "baseline": (np.array(trail) * 60 / BIN).round().tolist(), "score": np.round(score, 1).tolist()}))
+        "baseline": (np.array(trail) * 60 / BIN).round().tolist(), "score": np.round(score, 1).tolist(),
+        "audio": np.round(au - (np.median(au) if len(audio) else 0), 1).tolist(), "words": np.round(words, 1).tolist(),
+        "comments": np.round(cm, 1).tolist()}))
+    if segs:  # skim: one line per 30 s so Claude can find stories, takes and setups the scores missed
+        lines, mark = {}, {int(m["peak"] // 30): k for k, m in enumerate(moments, 1)}
+        for s0, _, text in segs:
+            lines.setdefault(int(s0 // 30), []).append(text)
+        (d / "skim.txt").write_text("".join(
+            f"[{hms(b * 30)}]{' *#' + str(mark[b]) if b in mark else ''} {' '.join(' '.join(t).split()[:32])}\n"
+            for b, t in sorted(lines.items())))
     log(f"{len(moments)} moments -> {d / 'moments.json'}  (channel baseline ~{round(base)} msg/min)", "done", a.src)
     print(describe(d) + "\n")
     for k, m in enumerate(moments, 1):
-        print(f"#{k:<2} {hms(m['start'])}-{hms(m['end'])}  score {m['score']:>5}  chat {m['msgs_per_min']}/min, "
-              f"{m['people']} people/5s vs {m['people_baseline']} (z {m['chat_z']})  audio z {m['audio_z']}")
-        print(f"     {' | '.join(m['top_chat'][:4])}")
+        print(f"#{k:<2} {hms(m['start'])}-{hms(m['end'])}  score {m['score']:>5}  why: {'; '.join(m['why']) or 'combined signals'}")
+        if m["said"]:
+            print(f"     said: \"...{m['said'][-160:]}\"")
+        if m["top_chat"]:
+            print(f"     chat: {' | '.join(m['top_chat'][:4])}")
+        for c in m["comments"][:1]:
+            print(f"     comment: {c}")
+    if segs:
+        print(f"\nskim: {d / 'skim.txt'} ({len((d / 'skim.txt').read_text()) // 4:,} tokens). Read it for moments the scores miss.")
 
 
 # ---------- grab / prep ----------
 def grab(a):
-    s, e = secs(a.start), secs(a.end)
+    """One section (START END) or several picked moments at once (--moments 1,3,5): one Whisper load for all."""
+    if a.moments:
+        ms = json.loads((workdir(a.src) / "moments.json").read_text())
+        ranges = [(ms[int(k) - 1]["start"], ms[int(k) - 1]["end"]) for k in a.moments.split(",")]
+    elif a.start and a.end:
+        ranges = [(secs(a.start), secs(a.end))]
+    else:
+        raise SystemExit("grab needs START END, or --moments 1,3,5 after a scan")
+    for s, e in ranges:
+        grab_one(a, s, e)
+
+def grab_one(a, s, e):
     d = workdir(a.src) / f"m{int(s)}"
     d.mkdir(exist_ok=True)
     seg = d / "seg.mp4"
@@ -336,11 +482,36 @@ def grab(a):
         if is_local(a.src):
             ff("-ss", s, "-i", a.src, "-t", e - s, "-c", "copy", seg)
         else:
-            sh(ytdlp("-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "--download-sections", f"*{s}-{e}",
+            sh(ytdlp("-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "-S", "lang", "--download-sections", f"*{s}-{e}",
                      "--merge-output-format", "mp4", "-o", seg, a.src))
     (d / "meta.json").write_text(json.dumps({"src": a.src, "start": s, "end": e}))
+    write_context(d.parent, d, s, e)
     a.dir = d
     prep(a)
+
+def write_context(src_dir, d, s, e):
+    """Everything known about this moment before cutting it: why it scored, what was said around it, the chat in
+    that window, and YouTube comments pointing at it. The editor reads context.md first."""
+    ms = json.loads((src_dir / "moments.json").read_text()) if (src_dir / "moments.json").exists() else []
+    m = next((x for x in ms if x["start"] <= (s + e) / 2 <= x["end"]), {})
+    tr = next(iter(sorted(src_dir.glob("transcript_full.*.jsonl"))), None)
+    said = [x for x in (json.loads(l) for l in open(tr)) if s - 30 <= x[0] <= e + 10] if tr else []
+    chat = [x for x in (json.loads(l) for l in open(src_dir / "chat_norm.jsonl")) if s <= x[0] <= e + 15] \
+        if (src_dir / "chat_norm.jsonl").exists() else []
+    comments = [c for c in (comment_marks(source_info(d).get("src", ""), src_dir) if (src_dir / "comments.info.json").exists() else [])
+                if s - 20 <= c[0] <= e + 20]
+    ctx = {"window": [s, e], "why": m.get("why", []), "score": m.get("score"),
+           "said": [[round(x[0] - s, 1), x[2]] for x in said],
+           "chat": [[round(x[0] - s, 1), x[2], x[1]] for x in chat[:200]], "people": len({x[2] for x in chat}),
+           "comments": [[hms(c[0]), round(c[1], 1), c[2]] for c in sorted(comments, key=lambda c: -c[1])[:8]]}
+    (d / "context.json").write_text(json.dumps(ctx, ensure_ascii=False))
+    lines = [f"# Moment {hms(s)}-{hms(e)} (times below are seconds into seg.mp4; negative = before it)",
+             f"why it scored: {'; '.join(ctx['why']) or 'manual pick'}", "",
+             "## What was said (whole-stream transcript)", *[f"[{t:6.1f}] {x}" for t, x in ctx["said"]], "",
+             f"## Chat in this window: {len(chat)} messages from {ctx['people']} people",
+             *[f"[{t:6.1f}] {u}: {x}" for t, u, x in ctx["chat"][:40]], "",
+             "## YouTube comments pointing here", *[f"- {t} ({w} weight) {x}" for t, w, x in ctx["comments"]]]
+    (d / "context.md").write_text("\n".join(lines) + "\n")
 
 def duration(path):
     err = subprocess.run([FF, "-hide_banner", "-i", str(path)], capture_output=True, text=True).stderr
@@ -374,19 +545,18 @@ def sheet(seg, times, out, width=480):
     return out
 
 def frames(a):
-    d = Path(a.dir)
+    d = Path(a.dir).resolve()
     out = sheet(d / "seg.mp4", [secs(t) for t in a.times], d / f"frames_{'-'.join(a.times)}.jpg".replace(":", ""))
     print(out)
 
 def prep(a):
     from PIL import Image, ImageDraw
-    d = Path(a.dir)
+    d = Path(a.dir).resolve()
     seg = d / "seg.mp4"
     if not (d / "words.json").exists():
         log(f"transcribing ({a.model})", "progress", d)
-        from faster_whisper import WhisperModel
-        model = WhisperModel(a.model, device="auto", compute_type="auto")
-        segs, _ = model.transcribe(str(seg), word_timestamps=True, vad_filter=True)
+        segs, _ = whisper(a.model).transcribe(str(seg), word_timestamps=True, vad_filter=True,
+                                              language=source_info(d).get("lang") or None)
         words, lines = [], []
         for sg in segs:
             lines.append(f"[{sg.start:6.1f}-{sg.end:6.1f}] {sg.text.strip()}")
@@ -410,7 +580,6 @@ def prep(a):
     log(f"ready to edit: {d}", "done", d)
     print(f"  seg.mp4 ({dur:.1f}s)  transcript.txt  words.json  frame_grid.jpg ({img.width}x{img.height})  sheet.jpg (every {step:.1f}s)")
     print("  " + describe(d).replace("\n", "\n  "))
-    print((d / "transcript.txt").read_text())
 
 
 # ---------- render ----------
@@ -517,7 +686,7 @@ def encoder():
     return ["-c:v", "h264_videotoolbox" if "videotoolbox" in encs else "mpeg4", "-b:v", "10M"]
 
 def render(a):
-    d = Path(a.dir)
+    d = Path(a.dir).resolve()
     t0, t1 = secs(a.in_), secs(a.out)
     tmp = d / ".render"
     shutil.rmtree(tmp, ignore_errors=True)
@@ -589,7 +758,7 @@ def render(a):
         if text:
             text_png(text, tmp / f"{name}.png")
             inputs += ["-i", tmp / f"{name}.png"]
-            y = place(split + 100 if layouts[0] == "stack" else H * 0.78, 80)
+            y = place(split + 100 if layouts[0] == "stack" else H * 0.71, 80)
             g += f";[{v}][{k}:v]overlay=0:{y}[v{k}]"
             v, k = f"v{k}", k + 1
 
@@ -628,8 +797,9 @@ def live(a):
                            stdin=yt.stdout)
     import signal
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so `finally` stops the recorder instead of orphaning it
-    chat = []  # (wall time, message, user)
-    threading.Thread(target=live_chat, args=(a.src, lambda m, u: chat.append((time.time(), m, u))), daemon=True).start()
+    chat, chat_procs = [], []  # (wall time, message, user); chat child processes to stop on exit
+    threading.Thread(target=live_chat, args=(a.src, lambda m, u: chat.append((time.time(), m, u)), d, chat_procs),
+                     daemon=True).start()
 
     log(f"live: watching {a.src} -> {d}  (baseline warms up for ~1 min)", "start", a.src)
     counts, people, last, pending = [], [], 0.0, []
@@ -654,9 +824,9 @@ def live(a):
                     f.unlink(missing_ok=True)
             del chat[: max(0, len(chat) - 20000)]  # bound memory on long streams
     finally:
-        for p in (yt, rec):
+        for p in (yt, rec, *chat_procs):
             p.terminate()
-        for p in (yt, rec):
+        for p in (yt, rec, *chat_procs):
             try:
                 p.wait(5)
             except subprocess.TimeoutExpired:
@@ -708,6 +878,7 @@ def state():
                             for f in sorted(m.glob("*.mp4"), key=lambda f: f.stat().st_mtime) if f.name != "seg.mp4"],
                 "post": (m / "post.md").read_text() if (m / "post.md").exists() else None,
                 "chat": (m / "chat.txt").read_text().splitlines()[-8:] if (m / "chat.txt").exists() else None,
+                "context": rd(m / "context.json"),
             })
         sources.append({"name": d.name, "info": rd(d / "info.json") or {}, "moments": rd(d / "moments.json") or [], "timeline": rd(d / "timeline.json"),
                         "pulse": rd(d / "live/pulse.json"), "clips": clips})
@@ -721,9 +892,12 @@ RENDER_FLAGS = {"in": "--in", "out": "--out", "layout": "--layout", "cam": "--ca
                 "split": "--split", "focus": "--focus", "hook": "--hook", "hook_secs": "--hook-secs", "hook_y": "--hook-y",
                 "cap_y": "--cap-y", "words": "--words", "tag": "--tag", "name": "--name", "shots": "--shots"}
 RENDER_SWITCHES = {"no_captions": "--no-captions", "no_tag": "--no-tag", "remember": "--remember"}
-# headless runs: subagents don't inherit the --allowedTools grant in -p mode, so the session edits directly
-HEADLESS = ("Work autonomously and don't ask questions. Do the editing yourself in this session, one clip at a time, "
-            "following agents/clip-editor.md; don't spawn subagents. ")
+# headless runs: commands must be bare `uv run ...` (a `D=...;` or `cd ..;` prefix doesn't match the allow rule)
+HEADLESS = ("Work autonomously and don't ask questions. Edit clips in parallel: spawn one clip-editor subagent per clip, "
+            "all in a single message, each with its moment dir, the clipper.py path, the channel and the moment's why/said. "
+            "Run scan and grab in the foreground with a 600000 ms "
+            "timeout; never poll with Monitor or sleep. If scan times out on a long stream, run it again: it resumes. "
+            "Grab all picks in one call with --moments. ")
 
 def check_src(src):
     src = str(src or "").strip()
@@ -741,8 +915,12 @@ def claude_cmd(prompt, model):
     if not shutil.which("claude"):
         raise ValueError("The claude CLI isn't on PATH. Run this from Claude Code instead, or install Claude Code.")
     model = model if model in ("haiku", "sonnet", "opus") else "sonnet"
+    allow = ["Bash(uv run:*)", "Read", "Write", "Edit", "Grep", "Glob", "Agent"]
     return ["claude", "-p", prompt, "--model", model, "--plugin-dir", str(Path(__file__).resolve().parents[2]),
-            "--permission-mode", "acceptEdits", "--allowedTools", "Bash(uv run:*)", "Read", "Write", "Edit", "Agent"], model
+            "--permission-mode", "acceptEdits", "--allowedTools", *allow,
+            "--settings", json.dumps({"permissions": {"allow": allow}}),
+            # measured: ~40k -> ~20k context tokens on every turn (no MCP servers, none of the user's other plugins)
+            "--strict-mcp-config", "--setting-sources", "project"], model
 
 def start_job(b):
     """Dashboard actions -> background jobs. Everything is passed as argv (no shell) after validation."""
@@ -910,7 +1088,10 @@ def main():
     s.add_argument("--pre", type=int, default=40); s.add_argument("--post", type=int, default=15)
     s.add_argument("--no-audio", action="store_true")
     s.add_argument("--chat", help="chat file: TwitchDownloader JSON, yt-dlp .live_chat.json, or jsonl [seconds, text]")
-    g = sub.add_parser("grab"); g.add_argument("src"); g.add_argument("start"); g.add_argument("end")
+    s.add_argument("--no-transcript", action="store_true", help="skip whole-stream transcription (faster, chat/audio only)")
+    s.add_argument("--transcript-model", default="base", help="Whisper model for the whole-stream skim (default base)")
+    g = sub.add_parser("grab"); g.add_argument("src"); g.add_argument("start", nargs="?"); g.add_argument("end", nargs="?")
+    g.add_argument("--moments", help="grab several scanned moments at once, e.g. 1,3,5")
     g.add_argument("--model", default="small")
     pr = sub.add_parser("prep"); pr.add_argument("dir"); pr.add_argument("--model", default="small")
     r = sub.add_parser("render"); r.add_argument("dir")

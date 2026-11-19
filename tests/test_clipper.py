@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = ["numpy", "pillow", "imageio-ffmpeg"]
 # ///
 """Self-check for the logic that can silently go wrong. Run: uv run --script tests/test_clipper.py"""

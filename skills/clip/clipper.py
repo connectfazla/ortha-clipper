@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.11"
 # dependencies = ["yt-dlp", "faster-whisper", "pillow", "numpy", "imageio-ffmpeg"]
 # ///
 """Ortha Clipper: stream -> chat-spike moments -> captioned 9:16 shorts.
@@ -350,7 +350,17 @@ def loudness(path, src):
             log(f"audio: {hms(len(out) * BIN)} analysed", "progress", src)
     return np.array(out)
 
+def is_live(src):
+    """True when the link is a stream that's live right now (a Twitch channel page, or a live YouTube video)."""
+    if is_local(src):
+        return False
+    r = subprocess.run(ytdlp("--skip-download", "--print", "%(is_live)s", src), capture_output=True, text=True)
+    return r.stdout.strip().splitlines()[:1] == ["True"]
+
 def scan(a):
+    if is_live(a.src):  # one action for the user: a live link gets watched live instead of scanned
+        log(f"{a.src} is live right now, so watching it live instead of scanning", "progress", a.src)
+        return live(argparse.Namespace(src=a.src, threshold=3.5, pre=40, post=15))
     d = workdir(a.src)
     log(f"scan started: {a.src}", "start", a.src)
     msgs = load_chat(a.src, d, a.chat) if (a.chat or not is_local(a.src)) else []
@@ -787,16 +797,30 @@ def render(a):
 
 
 # ---------- live ----------
+def recorder(src, buf):
+    """ffmpeg reading the live stream straight into 5 s segments. YouTube live only offers separate video and audio
+    HLS streams (yt-dlp can't merge those to stdout), so resolve the URLs and hand ffmpeg both."""
+    urls = subprocess.run(ytdlp("-g", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "-S", "lang", src),
+                          capture_output=True, text=True).stdout.split()
+    if not urls:
+        return None
+    inputs = [x for u in urls for x in ("-i", u)]
+    maps = ["-map", "0:v:0", "-map", "1:a:0"] if len(urls) > 1 else []
+    return subprocess.Popen([FF, "-hide_banner", "-loglevel", "error", *inputs, *maps, "-c", "copy", "-f", "segment",
+                             "-segment_time", "5", "-reset_timestamps", "1", "-strftime", "1", str(buf / "%s.ts")])
+
 def live(a):
     d = workdir(a.src) / "live"
     buf = d / "buf"
     buf.mkdir(parents=True, exist_ok=True)
-    yt = subprocess.Popen(ytdlp("-f", "b[height<=1080]/b", "-o", "-", a.src), stdout=subprocess.PIPE)
-    rec = subprocess.Popen([FF, "-hide_banner", "-loglevel", "error", "-i", "-", "-c", "copy", "-f", "segment",
-                            "-segment_time", "5", "-reset_timestamps", "1", "-strftime", "1", str(buf / "%s.ts")],
-                           stdin=yt.stdout)
+    rec = recorder(a.src, buf)
+    if not rec:
+        log(f"live: couldn't open {a.src}. Is it live right now?", "error", a.src)
+        raise SystemExit(1)
+    rec_started, retries = time.time(), 0
     import signal
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # so `finally` stops the recorder instead of orphaning it
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGALRM, signal.SIGQUIT):  # any stop runs `finally`,
+        signal.signal(sig, lambda *_: sys.exit(0))                             # so the recorder is never orphaned
     chat, chat_procs = [], []  # (wall time, message, user); chat child processes to stop on exit
     threading.Thread(target=live_chat, args=(a.src, lambda m, u: chat.append((time.time(), m, u)), d, chat_procs),
                      daemon=True).start()
@@ -804,9 +828,20 @@ def live(a):
     log(f"live: watching {a.src} -> {d}  (baseline warms up for ~1 min)", "start", a.src)
     counts, people, last, pending = [], [], 0.0, []
     try:
-        while rec.poll() is None:
+        while True:
             time.sleep(BIN)
             now = time.time()
+            if rec.poll() is not None:  # URL expired or the network dropped: reconnect, give up after 5 tries in a row
+                if now - rec_started > 120:
+                    retries = 0
+                if retries >= 5:
+                    log("live: the stream ended or can't be reached", "done", a.src)
+                    break
+                retries += 1
+                log(f"live: recorder stopped, reconnecting ({retries}/5)", "progress", a.src)
+                rec = recorder(a.src, buf) or rec
+                rec_started = now
+                continue
             recent = [c for c in chat if c[0] > now - BIN]
             counts.append(len(recent))
             people.append(len({u for _, _, u in recent}))  # distinct chatters, so one spammer can't fake a spike
@@ -824,9 +859,9 @@ def live(a):
                     f.unlink(missing_ok=True)
             del chat[: max(0, len(chat) - 20000)]  # bound memory on long streams
     finally:
-        for p in (yt, rec, *chat_procs):
+        for p in (rec, *chat_procs):
             p.terminate()
-        for p in (yt, rec, *chat_procs):
+        for p in (rec, *chat_procs):
             try:
                 p.wait(5)
             except subprocess.TimeoutExpired:

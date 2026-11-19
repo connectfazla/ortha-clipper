@@ -83,13 +83,13 @@ Every command opens a local dashboard at **http://localhost:8790**.
   <img src="docs/home.png" alt="Ortha Clipper home dashboard: paste a stream link, streams with GTA VI tags and moment counts, recent vertical clips" width="100%">
 </p>
 
-- **Home:** paste a link and choose *Find moments* (no AI tokens), *Auto-clip with Claude* (Haiku, Sonnet or Opus), or *Watch live*. See running jobs, every stream, and your recent clips.
+- **Home:** paste a link and press *Find moments* (no AI tokens) or *Auto-clip with Claude* (Haiku, Sonnet or Opus). A link that's live right now gets watched live automatically. Running jobs show their latest step and a Stop button, each stream card says what's happening and what to do next, and recent clips open in one click. Your tag is in the header, and clicking *Ortha Clipper* always brings you back Home.
 - **Editor:** a pro editing layout.
   - The 16:9 source with **framing boxes you draw on the video**, next to a live 9:16 output preview.
   - A transport bar, and a timeline with transcript and chat tracks and drag-to-trim handles. Keys: `Space` plays, `I`/`O` set in and out.
   - A whole-stream view with chat, audio, speech and comment tracks and every moment marked.
 - **Inspector:**
-  - **Edit:** layout, trim, hook, captions, tag, render, or hand the clip to Claude with notes.
+  - **Edit:** why the moment scored, then layout, trim, hook, captions and tag. *Ask Claude* and *Render clip* stay pinned at the bottom.
   - **Context:** why the moment scored, the transcript before and after it, the chat in that window, and the comments.
   - **Publish:** QA frames, post copy and versions.
 - **All clips:** every render in one grid.
